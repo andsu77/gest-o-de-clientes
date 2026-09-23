@@ -21,6 +21,11 @@ import { createApiRoutes } from './routes';
 export function createApp(container: Container): Express {
   const app = express();
 
+  // Em produção (ex.: Render) o app fica atrás de um proxy. Sem isto, todo
+  // visitante teria o IP do proxy e o limite de tentativas de login valeria
+  // para todos ao mesmo tempo.
+  if (env.NODE_ENV === 'production') app.set('trust proxy', 1);
+
   // Helmet: adiciona cabeçalhos HTTP de segurança (bloqueia iframes de outros
   // sites, scripts inline não autorizados etc.). Por isso o front não usa
   // onclick="..." no HTML: todo JS fica em arquivos .js (política CSP).
