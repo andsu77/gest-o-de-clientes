@@ -1,0 +1,11 @@
+{
+  // Configuração de build: compila APENAS src/ para dist/ (testes e seed ficam de fora).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "types": ["node"]
+  },
+  "include": ["src"]
+}

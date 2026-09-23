@@ -1,0 +1,281 @@
+// =============================================================================
+// SCHEMA DO BANCO DE DADOS (Prisma + MySQL)
+// =============================================================================
+// Este arquivo é a "fonte da verdade" do banco. A partir dele o Prisma:
+//   1. gera as migrations SQL (npx prisma migrate dev)
+//   2. gera um client TIPADO (npx prisma generate) usado pelos repositories.
+//
+// Convenções adotadas:
+//   - Nomes de models em inglês/PascalCase no código; nomes de tabelas em
+//     snake_case no banco (via @@map), igual ao que foi pedido: clients,
+//     services, client_services, payments...
+//   - Dinheiro é guardado em CENTAVOS (Int). Ex.: R$ 70,00 => 7000.
+//     Motivo: números de ponto flutuante erram contas simples
+//     (0.1 + 0.2 = 0.30000000000000004). Inteiros não erram.
+//   - Datas "de calendário" (vencimento, pagamento, início) usam @db.Date,
+//     sem horário, para evitar confusão com fuso horário.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS — conjuntos fechados de valores. O banco rejeita qualquer outro valor.
+// (Sem acentos para evitar problemas de encoding: UNICA, CARTAO, CONCLUIDA.)
+// ---------------------------------------------------------------------------
+
+enum ClientStatus {
+  ATIVO
+  INADIMPLENTE
+  PAUSADO
+  ENCERRADO
+}
+
+enum BillingType {
+  UNICA
+  MENSAL
+  ANUAL
+  PERSONALIZADA
+}
+
+enum ServiceStatus {
+  ATIVO
+  INATIVO
+}
+
+enum ContractStatus {
+  ATIVO
+  PAUSADO
+  ENCERRADO
+}
+
+enum PaymentStatus {
+  PENDENTE
+  PAGO
+  ATRASADO
+  CANCELADO
+}
+
+enum PaymentMethod {
+  PIX
+  DINHEIRO
+  CARTAO
+  TRANSFERENCIA
+  OUTRO
+}
+
+enum SiteStatus {
+  DESENVOLVIMENTO
+  ONLINE
+  PAUSADO
+  ENCERRADO
+}
+
+enum MaintenanceStatus {
+  ABERTA
+  EM_ANDAMENTO
+  CONCLUIDA
+}
+
+// ---------------------------------------------------------------------------
+// TABELAS
+// ---------------------------------------------------------------------------
+
+/// Administradores do painel. A senha NUNCA é salva: guardamos só o hash bcrypt.
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String   @db.VarChar(120)
+  email        String   @unique @db.VarChar(160)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+/// Clientes. Client 1 ---- N Contract / Payment / Site / Maintenance
+model Client {
+  id        Int          @id @default(autoincrement())
+  name      String       @db.VarChar(120)
+  company   String?      @db.VarChar(120)
+  document  String?      @db.VarChar(20) // CPF/CNPJ (opcional)
+  phone     String?      @db.VarChar(30)
+  whatsapp  String?      @db.VarChar(30)
+  email     String?      @db.VarChar(160)
+  address   String?      @db.VarChar(255)
+  notes     String?      @db.Text
+  status    ClientStatus @default(ATIVO)
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  contracts    Contract[]
+  payments     Payment[]
+  sites        Site[]
+  maintenances Maintenance[]
+  auditLogs    AuditLog[]
+
+  @@index([status])
+  @@map("clients")
+}
+
+/// Catálogo de serviços que você vende (o "cardápio").
+/// O preço daqui é o preço de TABELA; o preço real fica na contratação.
+model Service {
+  id          Int           @id @default(autoincrement())
+  name        String        @db.VarChar(120)
+  description String?       @db.Text
+  priceCents  Int           @map("price_cents")
+  billingType BillingType   @map("billing_type")
+  status      ServiceStatus @default(ATIVO)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  contracts Contract[]
+
+  @@map("services")
+}
+
+/// CONTRATAÇÃO: a tabela de ligação N:N entre Client e Service
+/// (a "client_services" pedida). Ela existe porque cada contratação tem
+/// dados PRÓPRIOS: valor negociado, vencimento, início, fim, status.
+/// Chamamos de "Contract" no código para não confundir com a classe
+/// ClientService (camada de serviço de clientes).
+model Contract {
+  id          Int            @id @default(autoincrement())
+  clientId    Int            @map("client_id")
+  serviceId   Int            @map("service_id")
+  priceCents  Int            @map("price_cents")
+  billingType BillingType    @map("billing_type")
+  startDate   DateTime       @map("start_date") @db.Date
+  endDate     DateTime?      @map("end_date") @db.Date
+  dueDay      Int?           @map("due_day") // dia do vencimento (1-31) para recorrentes
+  status      ContractStatus @default(ATIVO)
+  notes       String?        @db.Text
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  client   Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  service  Service   @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  payments Payment[]
+
+  @@index([clientId])
+  @@index([status, billingType])
+  @@map("client_services")
+}
+
+/// Cobranças/pagamentos. Uma cobrança pode vir de uma contratação
+/// (mensalidade, pagamento único) ou ser avulsa (contractId nulo).
+model Payment {
+  id             Int            @id @default(autoincrement())
+  clientId       Int            @map("client_id")
+  contractId     Int?           @map("contract_id")
+  amountCents    Int            @map("amount_cents")
+  dueDate        DateTime       @map("due_date") @db.Date
+  paidAt         DateTime?      @map("paid_at") @db.Date
+  status         PaymentStatus  @default(PENDENTE)
+  method         PaymentMethod?
+  /// "AAAA-MM" — preenchido nas mensalidades geradas automaticamente.
+  referenceMonth String?        @map("reference_month") @db.VarChar(7)
+  description    String?        @db.VarChar(160)
+  notes          String?        @db.Text
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  client   Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contract Contract? @relation(fields: [contractId], references: [id], onDelete: SetNull)
+
+  // Garante no BANCO que não existem duas mensalidades do mesmo mês para a
+  // mesma contratação — mesmo se o código tiver um bug.
+  @@unique([contractId, referenceMonth])
+  @@index([status, dueDate])
+  @@index([paidAt])
+  @@map("payments")
+}
+
+/// Sites dos clientes (controle administrativo, sem hospedagem real).
+model Site {
+  id          Int        @id @default(autoincrement())
+  clientId    Int        @map("client_id")
+  projectName String     @map("project_name") @db.VarChar(120)
+  domain      String?    @db.VarChar(160)
+  url         String?    @db.VarChar(255)
+  hosting     String?    @db.VarChar(120)
+  publishedAt DateTime?  @map("published_at") @db.Date
+  status      SiteStatus @default(DESENVOLVIMENTO)
+  notes       String?    @db.Text
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  client       Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  maintenances Maintenance[]
+
+  @@map("sites")
+}
+
+/// Manutenções feitas para um cliente (e opcionalmente para um site dele).
+model Maintenance {
+  id           Int               @id @default(autoincrement())
+  clientId     Int               @map("client_id")
+  siteId       Int?              @map("site_id")
+  date         DateTime          @db.Date
+  type         String            @db.VarChar(80)
+  description  String            @db.Text
+  status       MaintenanceStatus @default(ABERTA)
+  notes        String?           @db.Text
+  chargedCents Int?              @map("charged_cents")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  site   Site?  @relation(fields: [siteId], references: [id], onDelete: SetNull)
+
+  @@map("maintenance")
+}
+
+/// Histórico de eventos importantes (auditoria). Alimenta a linha do tempo
+/// do cliente. clientId vira NULL se o cliente for excluído, preservando o registro.
+model AuditLog {
+  id          Int      @id @default(autoincrement())
+  clientId    Int?     @map("client_id")
+  entity      String   @db.VarChar(40)
+  entityId    Int      @map("entity_id")
+  action      String   @db.VarChar(40)
+  description String   @db.VarChar(255)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  client Client? @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  @@index([clientId])
+  @@map("audit_logs")
+}
+
+/// Resultado final de uma tentativa de contato com um potencial cliente.
+enum ContactOutcome {
+  AGUARDANDO
+  DEU_CERTO
+  NAO_DEU_CERTO
+}
+
+/// Lista de contatos: pessoas com quem você pretende falar no futuro
+/// (ainda não são clientes). "messaged" marca se a mensagem já foi enviada.
+model Contact {
+  id          Int            @id @default(autoincrement())
+  name        String         @db.VarChar(120)
+  phone       String?        @db.VarChar(30)
+  email       String?        @db.VarChar(160)
+  contactDate DateTime?      @map("contact_date") @db.Date
+  messaged    Boolean        @default(false)
+  outcome     ContactOutcome @default(AGUARDANDO)
+  notes       String?        @db.Text
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  @@index([outcome])
+  @@map("contacts")
+}
